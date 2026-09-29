@@ -1,12 +1,15 @@
 """HTTP API 端到端测试（线程内起真实服务器）。"""
 
 import json
+import base64
+import struct
 import threading
 import unittest
 import urllib.request
 import urllib.error
 
 from app.server import build_server
+from app.tsig import sign_message
 
 OLD = """$ORIGIN lab.test.
 $TTL 300
@@ -309,6 +312,73 @@ class RpzApiTests(unittest.TestCase):
     def test_bad_request_is_400(self):
         status, body = _request(
             self.base + "/api/rpz/evaluate", {"qname": "h.example."})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "invalid_request")
+
+
+class TsigApiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.server = build_server("127.0.0.1", 0, ":memory:")
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+        cls.base = f"http://127.0.0.1:{cls.port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    @staticmethod
+    def _query(message_id=0x1234):
+        qname = (
+            b"\x04host\x07example\x03com\x00" + struct.pack("!HH", 1, 1)
+        )
+        return struct.pack("!HHHHHH", message_id, 0x0100, 1, 0, 0, 0) + qname
+
+    def _payload(self, msg, **overrides):
+        payload = {
+            "message": base64.b64encode(msg).decode(),
+            "shared_secret": base64.b64encode(b"secret").decode(),
+            "key_name": "key.example.com.",
+            "now": 1700000000,
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_authenticated(self):
+        msg = sign_message(self._query(), "key.example.com.", b"secret",
+                           1700000000, fudge=300)
+        status, body = _request(self.base + "/api/tsig/verify",
+                                self._payload(msg))
+        self.assertEqual(status, 200, body)
+        tsig = body["tsig"]
+        self.assertEqual(tsig["status"], "authenticated")
+        self.assertTrue(tsig["authenticated"])
+        self.assertNotIn("secret", json.dumps(body))
+
+    def test_badtime_is_200_with_48bit_time(self):
+        msg = sign_message(self._query(), "key.example.com.", b"secret",
+                           1700000000, fudge=300)
+        status, body = _request(self.base + "/api/tsig/verify",
+                                self._payload(msg, now=1700000999))
+        self.assertEqual(status, 200)
+        tsig = body["tsig"]
+        self.assertEqual(tsig["status"], "badtime")
+        self.assertEqual(tsig["time_signed"], 1700000000)
+        self.assertEqual(tsig["time_high"], 0)
+        self.assertEqual(tsig["time_low"], 1700000000)
+
+    def test_missing_tsig_is_422(self):
+        status, body = _request(self.base + "/api/tsig/verify",
+                                self._payload(self._query()))
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"]["code"], "tsig_not_found")
+
+    def test_bad_request_is_400(self):
+        status, body = _request(self.base + "/api/tsig/verify", {})
         self.assertEqual(status, 400)
         self.assertEqual(body["error"]["code"], "invalid_request")
 
