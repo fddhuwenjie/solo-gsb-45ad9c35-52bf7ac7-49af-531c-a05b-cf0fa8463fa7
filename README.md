@@ -31,6 +31,14 @@ RRset/CNAME 各自 TTL 衰减、沿 CNAME 链取答、NXDOMAIN/NODATA 否定缓�
 通配，地址按 RPZ 反向前缀编码），按“最小策略区序号 → 触发器次序 →
 最长匹配”选出唯一规则，识别 NXDOMAIN/NODATA/PASSTHRU/DROP/TCP-ONLY
 与改写动作，并返回命中规则、全部候选与选择理由。
+新增 `POST /api/tsig/verify`，离线校验一个携带 TSIG（RFC 8945，
+取代 RFC 2845）的 Base64 DNS 报文：TSIG 必须唯一且位于附加区末尾
+（CLASS=ANY、TTL=0、Original ID 等于报文 ID），按 RFC 8945 §5.2 从
+原报文移除 TSIG、递减 ARCOUNT 并规范编码算法名与变量计算 HMAC
+（支持 hmac-sha256/hmac-sha512，核对响应时前置 request_mac 的长度和
+内容），依次核对密钥名、算法、MAC（`hmac.compare_digest`）与时间窗，
+分别返回 `badkey`/`badalg`/`badsig`/`badtime`（`badtime` 附 48 位
+服务器时间），成功返回 `authenticated` 与不泄露密钥的轨迹。
 除 TLSA 校验的 PEM 证书解析使用 `cryptography`（见
 `requirements.txt`，镜像内自动安装）外，仅使用 Python 标准库
 （`http.server.ThreadingHTTPServer` + `sqlite3`）。
@@ -697,6 +705,108 @@ curl -s http://localhost:8080/api/rpz/evaluate \
 #    则命中 RESPONSE-IP /32 -> result="rewrite"
 ```
 
+## 离线 TSIG 报文校验（`POST /api/tsig/verify`）
+
+不发起任何真实 DNS 查询：输入一个 **Base64 编码的单个 DNS 报文**
+（`message`）、共享密钥（`secret`，默认按 UTF-8 取字节，
+`secret_encoding="base64"` 时按 Base64 解码）、期望密钥名
+（`key_name`，大小写不敏感，可写相对名自动补根点）与当前时间
+（`now`，0..2^48−1 的 Unix 秒整数）；核对**响应**报文时另给对应
+请求的 `request_mac`（Base64）。按 RFC 8945（取代 RFC 2845）离线
+验证 TSIG。
+
+结构要求（任一不符均为 **HTTP 422**）：
+
+- 报文中 TSIG（TYPE=250）必须**恰好一条**（`missing_tsig` /
+  `multiple_tsig`），且位于**附加区最后一条**（`tsig_not_last`），
+  位于回答/授权区为 `tsig_wrong_section`；
+- TSIG 的 CLASS 必须为 **ANY（255）**、TTL 必须为 **0**
+  （`tsig_bad_class` / `tsig_bad_ttl`）；
+- RDATA 中的 **Original ID 必须等于报文头 ID**
+  （`tsig_original_id_mismatch`）；
+- 报文或各区/TSIG RDATA 截断（`message_truncated`）、压缩指针越界
+  （`compression_pointer_out_of_bounds`）或成环
+  （`compression_pointer_loop`）、非法名称（`invalid_name`）、
+  各区解析后存在尾随字节（`message_trailing_bytes`）。
+
+MAC 计算（RFC 8945 §5.2，HMAC 密钥即共享密钥的字节编码）：
+
+1. 从原报文**移除 TSIG RR**（TSIG 位于附加区末尾，即截断到其起始
+   偏移），并把头中 **ARCOUNT 减一**；
+2. 核对响应且提供 `request_mac` 时，在变量前**前置 request MAC 的
+   2 字节长度与内容**（请求不带此前缀）；
+3. 拼接规范编码的 TSIG 变量：Original ID（2 字节）、算法名（**小写、
+   不压缩**的规范 wire 域名）、Time Signed（**48 位/6 字节**）、
+   Fudge（2 字节）、MAC Size（2 字节，按 RDATA 中 MAC 长度，变量中
+   **不含 MAC 本身**）、Error（2 字节）、Other Len（2 字节）+ Other；
+4. 支持 `hmac-sha256.`（32 字节）与 `hmac-sha512.`（64 字节），
+   其它算法名为 `badalg`。
+
+按固定顺序核对，失败即返回该步结论（**均为 HTTP 200** 下的校验终态）：
+
+| 顺序 | 核对项 | 失败 `status` |
+| ---- | ------ | ------------- |
+| 1 | 密钥名（TSIG owner 与 `key_name`） | `badkey` |
+| 2 | 算法（仅 hmac-sha256/hmac-sha512） | `badalg` |
+| 3 | MAC（长度须等于摘要长度，恒用 `hmac.compare_digest` 比较） | `badsig` |
+| 4 | 时间窗（`|now - time_signed| <= fudge`，边界相等算通过） | `badtime` |
+
+`badtime` 响应额外附 **48 位服务器时间**：`server_time`（整数）与
+`server_time_hex`（12 个十六进制字符），并给出 `time_delta`。
+成功 `status="authenticated"`；任何终态响应都包含**有序 `trace`**
+（message → tsig → class_ttl → original_id → key → algorithm →
+mac → time → result，只执行到失败处）以及 `key_name`、`algorithm`、
+`message_id`、`time_signed`、`fudge`、`error`、`other_len`、
+`mac_size`、`now`、`request_mac_size` 等非敏感字段；**轨迹与结果
+绝不回显共享密钥、MAC 本体或其等价形式**。只有请求格式错误（400）
+与上述报文结构错误（422）走错误响应。
+
+请求体（完整示例见 `examples/tsig_verify.json`）：
+
+```json
+{
+  "message": "<Base64 编码、携带 TSIG 的 DNS 报文>",
+  "secret": "tsig-shared-secret",
+  "key_name": "tsig-key.example.com",
+  "now": 1759108920,
+  "request_mac": "<可选：核对响应时，对应请求 TSIG 的 Base64 MAC>"
+}
+```
+
+最小内联示例（报文与 HMAC 用标准库现场生成）：
+
+```bash
+python3 - <<'PY' | curl -s http://localhost:8080/api/tsig/verify \
+  -H 'Content-Type: application/json' --data @- | python3 -m json.tool
+import base64, hashlib, hmac, json, struct
+
+def wn(name):
+    out = bytearray()
+    for label in name.rstrip(".").split("."):
+        b = label.encode(); out.append(len(b)); out.extend(b)
+    return bytes(out) + b"\x00"
+
+key, secret, when = "k.example.", b"shared-secret", 1759108800
+alg = "hmac-sha256."
+msg_base = struct.pack("!HHHHHH", 0xABCD, 0x0100, 1, 0, 0, 1) \
+    + wn("t.example.") + struct.pack("!HH", 1, 1)   # 带 1 个空附加位
+var = (struct.pack("!H", 0xABCD) + wn(alg) + when.to_bytes(6, "big")
+       + struct.pack("!HHH", 300, 32, 0) + struct.pack("!H", 0))
+signed = bytearray(msg_base); struct.pack_into("!H", signed, 10, 0)  # ARCOUNT-1
+mac = hmac.new(secret, bytes(signed) + var, hashlib.sha256).digest()
+rdata = (wn(alg) + when.to_bytes(6, "big") + struct.pack("!H", 300)
+         + struct.pack("!H", len(mac)) + mac
+         + struct.pack("!HHH", 0xABCD, 0, 0))
+msg = msg_base + wn(key) + struct.pack("!HHIH", 250, 255, 0, len(rdata)) \
+    + rdata
+print(json.dumps({"message": base64.b64encode(msg).decode(),
+                  "secret": secret.decode(), "key_name": key,
+                  "now": when}))
+PY
+# -> tsig.status = "authenticated"
+#    now 改为 when+301（超出 fudge）则为 "badtime"，并附 server_time_hex
+```
+
 ## API
 
 | 方法 | 路径 | 说明 |
@@ -713,6 +823,7 @@ curl -s http://localhost:8080/api/rpz/evaluate \
 | `POST` | `/api/dns/delegation-trace` | 离线校验迭代解析轨迹（转介/胶水/地址子查询/CNAME 重启，共享 32 跳预算），返回 final_answer、逐记录取舍与地址来源图 |
 | `POST` | `/api/dns/cache/replay` | 离线复演递归缓存（TTL 衰减/CNAME 链取答/NXDOMAIN·NODATA 否定缓存/正负项冲突清理），逐项返回 hit·miss、答案、剩余 TTL、增删原因与最终快照 |
 | `POST` | `/api/rpz/evaluate` | 离线 RPZ 求值（QNAME/RESPONSE-IP/NSDNAME/NSIP 触发器、最小序号策略区+触发器次序+最长匹配、NXDOMAIN/NODATA/PASSTHRU/DROP/TCP-only/改写），返回命中规则、候选与选择理由 |
+| `POST` | `/api/tsig/verify` | 离线校验携带 TSIG（RFC 8945）的 Base64 DNS 报文（唯一且位于附加区末尾、CLASS=ANY/TTL=0/Original ID 一致；移除 TSIG、递减 ARCOUNT 后按 hmac-sha256/sha512 重算 MAC，响应前置 request_mac；依次 badkey/badalg/badsig/badtime，badtime 附 48 位时间），返回 authenticated 与不泄露密钥的轨迹 |
 | `GET`  | `/api/reviews` | 已确认审查列表 |
 | `GET`  | `/api/reviews/<id>` | 读取一条确认（含 `replay_request` 可原样复演） |
 | `GET`  | `/healthz` | 健康检查 |
@@ -825,6 +936,12 @@ curl -s http://localhost:8080/api/dns/cache/replay \
 curl -s http://localhost:8080/api/rpz/evaluate \
   -H 'Content-Type: application/json' \
   --data @examples/rpz_evaluate.json | python3 -m json.tool
+
+# 离线 TSIG 报文校验（hmac-sha256，时间在 fudge 窗内 -> authenticated；
+# 成功轨迹不回显共享密钥与 MAC 本体）
+curl -s http://localhost:8080/api/tsig/verify \
+  -H 'Content-Type: application/json' \
+  --data @examples/tsig_verify.json | python3 -m json.tool
 ```
 
 `/api/spf/evaluate` 的最小内联示例：
@@ -921,9 +1038,10 @@ app/
   delegation.py # 离线迭代解析轨迹校验（转介/胶水/地址子查询/CNAME 重启/32 跳预算）
   dnscache.py   # 离线 DNS 缓存复演（TTL 衰减/CNAME 链/NXDOMAIN·NODATA/冲突清理）
   rpz.py        # 离线 RPZ 求值（QNAME/RESPONSE-IP/NSDNAME/NSIP/策略区次序与最长匹配）
+  tsig.py       # 离线 TSIG（RFC 8945）报文校验（唯一/末尾/CLASS·TTL/Original ID + HMAC/时间窗）
   storage.py    # SQLite 持久化
   server.py     # ThreadingHTTPServer HTTP API
 requirements.txt # TLSA 证书解析依赖（cryptography；镜像内安装）
 tests/          # 单元与端到端测试
-examples/       # curl 示例请求（review.json / spf_evaluate.json / nsec_proof.json / svcb_resolve.json / caa_authorize.json / zonemd_verify.json / tlsa_verify.json / axfr_inspect.json / delegation_trace.json / dns_cache_replay.json / rpz_evaluate.json 等）
+examples/       # curl 示例请求（review.json / spf_evaluate.json / nsec_proof.json / svcb_resolve.json / caa_authorize.json / zonemd_verify.json / tlsa_verify.json / axfr_inspect.json / delegation_trace.json / dns_cache_replay.json / rpz_evaluate.json / tsig_verify.json 等）
 ```

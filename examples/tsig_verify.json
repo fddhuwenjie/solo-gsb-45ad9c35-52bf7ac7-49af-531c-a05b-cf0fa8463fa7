@@ -1,0 +1,6 @@
+{
+  "message": "q80BAAABAAAAAAABA3d3dwdleGFtcGxlA2NvbQAAAQABCHRzaWcta2V5B2V4YW1wbGUDY29tAAD6AP8AAAAAAD0LaG1hYy1zaGEyNTYAAABo2d7AASwAIDhjiXgU9srN8KmduKxWSE5WcT28kv+6l+h1KVp9ybYlq80AAAAA",
+  "secret": "tsig-shared-secret",
+  "key_name": "tsig-key.example.com",
+  "now": 1759108920
+}

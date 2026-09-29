@@ -13,6 +13,7 @@
 - ``POST /api/dns/delegation-trace`` 离线校验迭代解析轨迹（转介/胶水/地址子查询）
 - ``POST /api/dns/cache/replay``     离线复演缓存（TTL 衰减/CNAME 链/否定缓存）
 - ``POST /api/rpz/evaluate``         离线 RPZ 求值（QNAME/RESPONSE-IP/NSDNAME/NSIP）
+- ``POST /api/tsig/verify``          离线校验携带 TSIG（RFC 8945）的 Base64 DNS 报文
 - ``GET  /api/reviews``            已确认审查列表
 - ``GET  /api/reviews/<id>``       读取已确认审查（含复演请求）
 - ``GET  /healthz``                健康检查
@@ -36,6 +37,7 @@ from .storage import Store
 from .svcb import resolve_svcb
 from .caa import authorize_caa
 from .tlsa import verify_tlsa
+from .tsig import verify_tsig
 from .zonemd import verify_zonemd
 
 MAX_BODY_BYTES = 2 * 1024 * 1024
@@ -122,6 +124,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_cache_replay()
         elif path == "/api/rpz/evaluate":
             self._handle_rpz_evaluate()
+        elif path == "/api/tsig/verify":
+            self._handle_tsig_verify()
         else:
             self._error(ReviewError("not_found", "未知路径", 404))
 
@@ -267,6 +271,18 @@ class Handler(BaseHTTPRequestHandler):
         # 只有请求格式（400）与 RPZ 区域解析/前缀/owner/冲突错误（422）
         # 走 _error
         self._send_json(200, {"rpz": result})
+
+    def _handle_tsig_verify(self) -> None:
+        try:
+            payload = self._read_json()
+            result = verify_tsig(payload)
+        except ReviewError as exc:
+            self._error(exc)
+            return
+        # authenticated/badkey/badalg/badsig/badtime 都是 200 下的校验
+        # 终态；只有请求格式（400）与报文结构错误（422，含 TSIG 不唯一/
+        # 不在附加区末尾/CLASS·TTL/Original ID/压缩指针越界/截断）走 _error
+        self._send_json(200, {"tsig": result})
 
     def log_message(self, fmt: str, *args) -> None:
         # ThreadingHTTPServer 下把日志写到 stderr 即可
